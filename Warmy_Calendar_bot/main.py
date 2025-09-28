@@ -603,46 +603,23 @@ def main():
     # Must be after ALL specific command handlers
     app.add_handler(MessageHandler(filters.COMMAND, plate_shortcut))
 
-    # Daily scheduler at 08:00 Europe/Vilnius
-    async def job_send_daily(context: ContextTypes.DEFAULT_TYPE):
-        if not (cfg.spreadsheet_id and cfg.google_credentials_path):
+    print("🤖 Starting bot...")
+    
+    # Add error handler for conflicts
+    def error_handler(update, context):
+        import logging
+        logging.basicConfig(level=logging.WARNING)
+        logger = logging.getLogger(__name__)
+        
+        if "Conflict" in str(context.error):
+            logger.warning("⚠️ Conflict detected - another bot instance may be running")
             return
-        client = SheetsClient(cfg.spreadsheet_id, cfg.google_credentials_path)
-        raw = client.read_data_rows(cfg.data_tab_name)
-        tuples = []
-        for r in raw:
-            ev = normalize_event(r.event_raw)
-            if not ev:
-                continue
-            exp = SheetsClient.parse_mmddyyyy(r.expiry_raw)
-            ts = None
-            if r.timestamp:
-                try:
-                    ts = dt.datetime.strptime(r.timestamp, "%m/%d/%Y %H:%M:%S")
-                except Exception:
-                    ts = None
-            tuples.append((r.plate, ev, exp, ts))
-        latest = latest_by_plate_event(tuples)
-        today = dt.date.today()
-        upcoming, expired = compute_windows(today, latest)
-        text = format_summary_lt(upcoming, expired)
-        repo = UsersRepo(client, cfg.users_tab_name)
-        approved = repo.list_approved()
-        for u in approved:
-            if u.telegram_chat_id:
-                try:
-                    await context.bot.send_message(chat_id=u.telegram_chat_id, text=text)
-                except Exception:
-                    pass
-
-    tz = dt.timezone(dt.timedelta(hours=0))
-    try:
-        import pytz  # from APScheduler
-        tz = pytz.timezone('Europe/Vilnius')
-    except Exception:
-        pass
-    app.job_queue.run_daily(job_send_daily, time=dt.time(hour=8, minute=0, tzinfo=tz), name="daily_send")
-    app.run_polling()
+        logger.error(f"❌ Bot error: {context.error}")
+    
+    app.add_error_handler(error_handler)
+    
+    # Start polling with conflict resolution
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
     main()
