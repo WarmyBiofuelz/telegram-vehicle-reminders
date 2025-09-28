@@ -606,7 +606,7 @@ def main():
     print("🤖 Starting bot...")
     
     # Add error handler for conflicts
-    def error_handler(update, context):
+    async def error_handler(update, context):
         import logging
         logging.basicConfig(level=logging.WARNING)
         logger = logging.getLogger(__name__)
