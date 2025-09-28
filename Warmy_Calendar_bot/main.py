@@ -49,12 +49,26 @@ async def send_daily_reminders():
         upcoming, expired = compute_windows(today, latest)
         text = format_summary_lt(upcoming, expired)
         
-        # Get approved users
+        # Get approved users + admins
         repo = UsersRepo(client, cfg.users_tab_name)
         approved = repo.list_approved()
+        all_users = repo.list_all()
         
-        if not approved:
-            print("📭 No approved users to send reminders to")
+        # Collect recipients: approved users + admins
+        recipients = set()  # Use set to avoid duplicates
+        
+        # Add approved users
+        for user in approved:
+            if user.telegram_chat_id:
+                recipients.add((user.telegram_chat_id, user.telegram_username or str(user.telegram_user_id)))
+        
+        # Add admins (if they exist in Users sheet)
+        for user in all_users:
+            if user.telegram_user_id in cfg.admin_user_ids and user.telegram_chat_id:
+                recipients.add((user.telegram_chat_id, f"Admin: {user.telegram_username or str(user.telegram_user_id)}"))
+        
+        if not recipients:
+            print("📭 No users or admins to send reminders to")
             return
         
         # Get bot instance for sending messages
@@ -64,19 +78,18 @@ async def send_daily_reminders():
         sent_count = 0
         error_count = 0
         
-        for user in approved:
-            if user.telegram_chat_id:
-                try:
-                    await bot.send_message(chat_id=user.telegram_chat_id, text=text)
-                    sent_count += 1
-                    print(f"📨 Daily reminder sent to {user.telegram_username or user.telegram_user_id}")
-                    
-                    # Small delay to avoid rate limits
-                    await asyncio.sleep(1)
-                    
-                except Exception as e:
-                    error_count += 1
-                    print(f"❌ Error sending reminder to {user.telegram_chat_id}: {e}")
+        for chat_id, name in recipients:
+            try:
+                await bot.send_message(chat_id=chat_id, text=text)
+                sent_count += 1
+                print(f"📨 Daily reminder sent to {name}")
+                
+                # Small delay to avoid rate limits
+                await asyncio.sleep(1)
+                
+            except Exception as e:
+                error_count += 1
+                print(f"❌ Error sending reminder to {chat_id}: {e}")
         
         print(f"✅ Daily reminder sending completed: {sent_count} sent, {error_count} errors")
         
