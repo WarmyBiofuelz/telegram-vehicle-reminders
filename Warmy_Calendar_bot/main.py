@@ -6,11 +6,110 @@ from .config import load_config
 from .sheets_client import SheetsClient
 from .data_model import normalize_event, latest_by_plate_event, compute_windows, format_summary_lt
 import datetime as dt
+import asyncio
+from datetime import timezone, timedelta
 from .users_repo import UsersRepo
 
 load_dotenv()
 
 cfg = load_config()
+
+async def send_daily_reminders():
+    """Send daily vehicle reminders to all approved users at 8:00 AM Lithuanian time."""
+    lithuania_tz = timezone(timedelta(hours=2))  # Lithuania is UTC+2 (UTC+3 in summer)
+    print("🕐 Starting daily reminder sending...")
+    
+    try:
+        if not (cfg.spreadsheet_id and cfg.google_credentials_path):
+            print("⚠️ Sheets configuration missing, skipping daily reminders")
+            return
+            
+        # Get vehicle data and process deadlines
+        client = SheetsClient(cfg.spreadsheet_id, cfg.google_credentials_path)
+        raw = client.read_data_rows(cfg.data_tab_name)
+        
+        # Normalize data
+        tuples = []
+        for r in raw:
+            ev = normalize_event(r.event_raw)
+            if not ev:
+                continue
+            exp = SheetsClient.parse_mmddyyyy(r.expiry_raw)
+            ts = None
+            if r.timestamp:
+                try:
+                    ts = dt.datetime.strptime(r.timestamp, "%m/%d/%Y %H:%M:%S")
+                except Exception:
+                    ts = None
+            tuples.append((r.plate, ev, exp, ts))
+        
+        # Process deadlines
+        latest = latest_by_plate_event(tuples)
+        today = dt.date.today()
+        upcoming, expired = compute_windows(today, latest)
+        text = format_summary_lt(upcoming, expired)
+        
+        # Get approved users
+        repo = UsersRepo(client, cfg.users_tab_name)
+        approved = repo.list_approved()
+        
+        if not approved:
+            print("📭 No approved users to send reminders to")
+            return
+        
+        # Get bot instance for sending messages
+        from telegram import Bot
+        bot = Bot(token=cfg.telegram_bot_token)
+        
+        sent_count = 0
+        error_count = 0
+        
+        for user in approved:
+            if user.telegram_chat_id:
+                try:
+                    await bot.send_message(chat_id=user.telegram_chat_id, text=text)
+                    sent_count += 1
+                    print(f"📨 Daily reminder sent to {user.telegram_username or user.telegram_user_id}")
+                    
+                    # Small delay to avoid rate limits
+                    await asyncio.sleep(1)
+                    
+                except Exception as e:
+                    error_count += 1
+                    print(f"❌ Error sending reminder to {user.telegram_chat_id}: {e}")
+        
+        print(f"✅ Daily reminder sending completed: {sent_count} sent, {error_count} errors")
+        
+    except Exception as e:
+        print(f"❌ Error in daily reminder sending: {e}")
+
+async def schedule_daily_reminders():
+    """Schedule daily reminder sending at 8:00 AM Lithuanian time."""
+    lithuania_tz = timezone(timedelta(hours=2))  # Lithuania is UTC+2 (UTC+3 in summer)
+    
+    while True:
+        try:
+            now = dt.datetime.now(lithuania_tz)
+            target_time = now.replace(hour=8, minute=0, second=0, microsecond=0)
+            
+            # If target time has passed today, set for tomorrow
+            if now >= target_time:
+                target_time += timedelta(days=1)
+            
+            # Calculate wait time
+            wait_seconds = (target_time - now).total_seconds()
+            print(f"📅 Next daily reminder scheduled for: {target_time} (in {wait_seconds/3600:.2f} hours)")
+            
+            # Wait until target time
+            await asyncio.sleep(wait_seconds)
+            
+            # Send daily reminders
+            await send_daily_reminders()
+            
+        except Exception as e:
+            print(f"❌ Error in reminder scheduler: {e}")
+            # Wait 1 hour before retrying
+            await asyncio.sleep(3600)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -618,8 +717,34 @@ def main():
     
     app.add_error_handler(error_handler)
     
-    # Start polling with conflict resolution
-    app.run_polling(drop_pending_updates=True)
+    # Start daily reminder scheduler in background
+    async def run_bot_with_scheduler():
+        # Start the scheduler task
+        scheduler_task = asyncio.create_task(schedule_daily_reminders())
+        print("📅 Daily reminder scheduler started")
+        
+        # Start the bot
+        async with app:
+            await app.initialize()
+            await app.start()
+            print("🤖 Bot started successfully")
+            
+            # Start polling
+            await app.updater.start_polling(drop_pending_updates=True)
+            
+            # Keep running until interrupted
+            try:
+                await asyncio.Event().wait()  # Wait indefinitely
+            except KeyboardInterrupt:
+                print("🛑 Shutting down...")
+            finally:
+                scheduler_task.cancel()
+                await app.updater.stop()
+                await app.stop()
+                await app.shutdown()
+    
+    # Run the bot with scheduler
+    asyncio.run(run_bot_with_scheduler())
 
 if __name__ == '__main__':
     main()
