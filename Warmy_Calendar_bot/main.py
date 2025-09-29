@@ -9,22 +9,31 @@ import datetime as dt
 import asyncio
 from datetime import timezone, timedelta
 from .users_repo import UsersRepo
+import time
 
 load_dotenv()
 
 cfg = load_config()
 
-async def send_daily_reminders():
-    """Send daily vehicle reminders to all approved users at 8:00 AM Lithuanian time."""
-    lithuania_tz = timezone(timedelta(hours=2))  # Lithuania is UTC+2 (UTC+3 in summer)
-    print("🕐 Starting daily reminder sending...")
+# Simple cache to reduce Google Sheets API calls
+_data_cache = {
+    'data': None,
+    'timestamp': 0,
+    'ttl': 300  # 5 minutes cache
+}
+
+def get_cached_vehicle_data():
+    """Get vehicle data with caching to reduce API calls"""
+    now = time.time()
+    if _data_cache['data'] is not None and (now - _data_cache['timestamp']) < _data_cache['ttl']:
+        print(f"📋 Using cached vehicle data (age: {int(now - _data_cache['timestamp'])}s)")
+        return _data_cache['data']
+    
+    print("🔄 Fetching fresh vehicle data from Google Sheets...")
+    if not (cfg.spreadsheet_id and cfg.google_credentials_path):
+        return []
     
     try:
-        if not (cfg.spreadsheet_id and cfg.google_credentials_path):
-            print("⚠️ Sheets configuration missing, skipping daily reminders")
-            return
-            
-        # Get vehicle data and process deadlines
         client = SheetsClient(cfg.spreadsheet_id, cfg.google_credentials_path)
         raw = client.read_data_rows(cfg.data_tab_name)
         
@@ -42,6 +51,33 @@ async def send_daily_reminders():
                 except Exception:
                     ts = None
             tuples.append((r.plate, ev, exp, ts))
+        
+        # Cache the result
+        _data_cache['data'] = tuples
+        _data_cache['timestamp'] = now
+        print(f"✅ Cached {len(tuples)} vehicle records")
+        return tuples
+        
+    except Exception as e:
+        print(f"❌ Error fetching vehicle data: {e}")
+        # Return cached data if available, even if expired
+        if _data_cache['data'] is not None:
+            print("⚠️ Using expired cache due to API error")
+            return _data_cache['data']
+        return []
+
+async def send_daily_reminders():
+    """Send daily vehicle reminders to all approved users at 8:00 AM Lithuanian time."""
+    lithuania_tz = timezone(timedelta(hours=2))  # Lithuania is UTC+2 (UTC+3 in summer)
+    print("🕐 Starting daily reminder sending...")
+    
+    try:
+        if not (cfg.spreadsheet_id and cfg.google_credentials_path):
+            print("⚠️ Sheets configuration missing, skipping daily reminders")
+            return
+            
+        # Get vehicle data and process deadlines
+        tuples = get_cached_vehicle_data()
         
         # Process deadlines
         latest = latest_by_plate_event(tuples)
@@ -207,25 +243,7 @@ def main():
     # Add a dry-run command for admins to preview today's summary in DM
     async def dryrun(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_admin(update):
-            if not (cfg.spreadsheet_id and cfg.google_credentials_path):
-                await update.message.reply_text("Trūksta Sheets konfigūracijos.")
-                return
-            client = SheetsClient(cfg.spreadsheet_id, cfg.google_credentials_path)
-            raw = client.read_data_rows(cfg.data_tab_name)
-            # Normalize
-            tuples = []
-            for r in raw:
-                ev = normalize_event(r.event_raw)
-                if not ev:
-                    continue
-                exp = SheetsClient.parse_mmddyyyy(r.expiry_raw)
-                ts = None
-                if r.timestamp:
-                    try:
-                        ts = dt.datetime.strptime(r.timestamp, "%m/%d/%Y %H:%M:%S")
-                    except Exception:
-                        ts = None
-                tuples.append((r.plate, ev, exp, ts))
+            tuples = get_cached_vehicle_data()
             latest = latest_by_plate_event(tuples)
             today = dt.date.today()
             upcoming, expired = compute_windows(today, latest)
@@ -249,25 +267,7 @@ def main():
         if not await is_approved_user(update):
             await update.message.reply_text("Jūsų prieiga dar nepatvirtinta.")
             return
-        if not (cfg.spreadsheet_id and cfg.google_credentials_path):
-            await update.message.reply_text("Trūksta Sheets konfigūracijos.")
-            return
-        client = SheetsClient(cfg.spreadsheet_id, cfg.google_credentials_path)
-        raw = client.read_data_rows(cfg.data_tab_name)
-        # Normalize
-        tuples = []
-        for r in raw:
-            ev = normalize_event(r.event_raw)
-            if not ev:
-                continue
-            exp = SheetsClient.parse_mmddyyyy(r.expiry_raw)
-            ts = None
-            if r.timestamp:
-                try:
-                    ts = dt.datetime.strptime(r.timestamp, "%m/%d/%Y %H:%M:%S")
-                except Exception:
-                    ts = None
-            tuples.append((r.plate, ev, exp, ts))
+        tuples = get_cached_vehicle_data()
         latest = latest_by_plate_event(tuples)
         today = dt.date.today()
         upcoming, expired = compute_windows(today, latest)
@@ -281,25 +281,7 @@ def main():
         if not await is_approved_user(update):
             await update.message.reply_text("Jūsų prieiga dar nepatvirtinta.")
             return
-        if not (cfg.spreadsheet_id and cfg.google_credentials_path):
-            await update.message.reply_text("Trūksta Sheets konfigūracijos.")
-            return
-        client = SheetsClient(cfg.spreadsheet_id, cfg.google_credentials_path)
-        raw = client.read_data_rows(cfg.data_tab_name)
-        tuples = []
-        for r in raw:
-            ev = normalize_event(r.event_raw)
-            if not ev:
-                continue
-            exp = SheetsClient.parse_mmddyyyy(r.expiry_raw)
-            ts = None
-            if r.timestamp:
-                try:
-                    ts = dt.datetime.strptime(r.timestamp, "%m/%d/%Y %H:%M:%S")
-                except Exception:
-                    ts = None
-            if r.plate:
-                tuples.append((r.plate.strip().upper(), ev, exp, ts))
+        tuples = get_cached_vehicle_data()
         latest = latest_by_plate_event(tuples)
         plates = sorted({r.plate for r in latest})
         if not plates:
@@ -326,25 +308,7 @@ def main():
             await update.message.reply_text("Naudojimas: /id <numeris>")
             return
         plate = args[0].strip().upper()
-        if not (cfg.spreadsheet_id and cfg.google_credentials_path):
-            await update.message.reply_text("Trūksta Sheets konfigūracijos.")
-            return
-        client = SheetsClient(cfg.spreadsheet_id, cfg.google_credentials_path)
-        raw = client.read_data_rows(cfg.data_tab_name)
-        tuples = []
-        for r in raw:
-            ev = normalize_event(r.event_raw)
-            if not ev:
-                continue
-            exp = SheetsClient.parse_mmddyyyy(r.expiry_raw)
-            ts = None
-            if r.timestamp:
-                try:
-                    ts = dt.datetime.strptime(r.timestamp, "%m/%d/%Y %H:%M:%S")
-                except Exception:
-                    ts = None
-            if r.plate:
-                tuples.append((r.plate.strip().upper(), ev, exp, ts))
+        tuples = get_cached_vehicle_data()
         latest = latest_by_plate_event(tuples)
         items = [r for r in latest if r.plate == plate]
         if not items:
