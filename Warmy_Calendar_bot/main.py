@@ -429,6 +429,102 @@ Administratoriaus komandos:
                     lines.append(f"- {label}: (duomenų nėra)")
             
             await q.edit_message_text("\n".join(lines))
+        
+        elif data.startswith("approve:"):
+            # Approve user from pending list
+            if not is_admin(update):
+                return
+            
+            try:
+                user_id = int(data.split(":", 1)[1])
+            except ValueError:
+                return
+            
+            if not (cfg.spreadsheet_id and cfg.google_credentials_path):
+                return
+            
+            client = SheetsClient(cfg.spreadsheet_id, cfg.google_credentials_path)
+            repo = UsersRepo(client, cfg.users_tab_name)
+            admin_name = update.effective_user.username or str(update.effective_user.id)
+            
+            success = repo.approve(user_id, admin_name)
+            if success:
+                # Clear user cache to reflect changes immediately
+                _users_cache['approved_users'] = set()
+                _users_cache['timestamp'] = 0
+                await q.edit_message_text(f"✅ Vartotojas {user_id} patvirtintas.")
+                
+                # Send welcome message to approved user
+                try:
+                    from telegram import Bot
+                    bot = Bot(token=cfg.telegram_bot_token)
+                    welcome_msg = """
+🎉 Sveikiname! Jūsų prieiga patvirtinta.
+
+Galimos komandos:
+/info - Šiandienos priminimas
+/sarasas - Visų numerių sąrašas  
+/id <numeris> - Konkretaus numerio duomenys
+
+Botas automatiškai siųs priminimus kiekvieną dieną 8:00 val.
+                    """
+                    await bot.send_message(chat_id=user_id, text=welcome_msg.strip())
+                except Exception as e:
+                    print(f"Failed to send welcome message to {user_id}: {e}")
+            else:
+                await q.edit_message_text(f"❌ Nepavyko patvirtinti vartotojo {user_id}.")
+        
+        elif data.startswith("reject:"):
+            # Reject user from pending list
+            if not is_admin(update):
+                return
+            
+            try:
+                user_id = int(data.split(":", 1)[1])
+            except ValueError:
+                return
+            
+            if not (cfg.spreadsheet_id and cfg.google_credentials_path):
+                return
+            
+            client = SheetsClient(cfg.spreadsheet_id, cfg.google_credentials_path)
+            repo = UsersRepo(client, cfg.users_tab_name)
+            admin_name = update.effective_user.username or str(update.effective_user.id)
+            
+            success = repo.reject(user_id, admin_name)
+            if success:
+                await q.edit_message_text(f"❌ Vartotojas {user_id} atmestas.")
+            else:
+                await q.edit_message_text(f"❌ Nepavyko atmesti vartotojo {user_id}.")
+        
+        elif data.startswith("delete_user:"):
+            # Delete user from users list
+            if not is_admin(update):
+                return
+            
+            try:
+                user_id = int(data.split(":", 1)[1])
+            except ValueError:
+                return
+            
+            if not (cfg.spreadsheet_id and cfg.google_credentials_path):
+                return
+            
+            client = SheetsClient(cfg.spreadsheet_id, cfg.google_credentials_path)
+            repo = UsersRepo(client, cfg.users_tab_name)
+            
+            success = repo.delete_user(user_id)
+            if success:
+                # Clear user cache to reflect changes immediately
+                _users_cache['approved_users'] = set()
+                _users_cache['timestamp'] = 0
+                await q.edit_message_text(f"🗑️ Vartotojas {user_id} ištrintas.")
+            else:
+                await q.edit_message_text(f"❌ Nepavyko ištrinti vartotojo {user_id}.")
+        
+        elif data.startswith("user_info:"):
+            # Show user info (placeholder for future enhancement)
+            await q.answer("Vartotojo informacija")
 
     app.add_handler(CallbackQueryHandler(on_cb))
 
@@ -473,6 +569,132 @@ Administratoriaus komandos:
         )
 
     app.add_handler(CommandHandler('pending', pending))
+
+    # Admin users management
+    async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not is_admin(update):
+            await update.message.reply_text("Neturite teisės naudoti šios komandos.")
+            return
+        
+        if not (cfg.spreadsheet_id and cfg.google_credentials_path):
+            await update.message.reply_text("Trūksta Sheets konfigūracijos.")
+            return
+        
+        client = SheetsClient(cfg.spreadsheet_id, cfg.google_credentials_path)
+        repo = UsersRepo(client, cfg.users_tab_name)
+        all_users = repo.list_all()
+        
+        if not all_users:
+            await update.message.reply_text("Vartotojų nėra.")
+            return
+        
+        buttons = []
+        for user in all_users:
+            username = user.telegram_username or str(user.telegram_user_id)
+            status = user.status or "unknown"
+            status_emoji = {"approved": "✅", "pending": "⏳", "rejected": "❌"}.get(status, "❓")
+            
+            buttons.append([
+                InlineKeyboardButton(
+                    f"{status_emoji} {username} ({status})", 
+                    callback_data=f"user_info:{user.telegram_user_id}"
+                ),
+                InlineKeyboardButton(
+                    "🗑️ Delete", 
+                    callback_data=f"delete_user:{user.telegram_user_id}"
+                )
+            ])
+        
+        await update.message.reply_text(
+            f"Visi vartotojai ({len(all_users)}):",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+
+    app.add_handler(CommandHandler('users', users_cmd))
+
+    # Admin approve command
+    async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not is_admin(update):
+            await update.message.reply_text("Neturite teisės naudoti šios komandos.")
+            return
+        
+        args = context.args or []
+        if not args:
+            await update.message.reply_text("Naudojimas: /approve <user_id>")
+            return
+        
+        try:
+            user_id = int(args[0])
+        except ValueError:
+            await update.message.reply_text("Neteisingas user_id.")
+            return
+        
+        if not (cfg.spreadsheet_id and cfg.google_credentials_path):
+            await update.message.reply_text("Trūksta Sheets konfigūracijos.")
+            return
+        
+        client = SheetsClient(cfg.spreadsheet_id, cfg.google_credentials_path)
+        repo = UsersRepo(client, cfg.users_tab_name)
+        admin_name = update.effective_user.username or str(update.effective_user.id)
+        
+        success = repo.approve(user_id, admin_name)
+        if success:
+            # Clear user cache to reflect changes immediately
+            _users_cache['approved_users'] = set()
+            _users_cache['timestamp'] = 0
+            await update.message.reply_text(f"✅ Vartotojas {user_id} patvirtintas.")
+        else:
+            await update.message.reply_text(f"❌ Nepavyko patvirtinti vartotojo {user_id}.")
+
+    app.add_handler(CommandHandler('approve', approve_cmd))
+
+    # Manual send today command
+    async def sendtoday_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not is_admin(update):
+            await update.message.reply_text("Neturite teisės naudoti šios komandos.")
+            return
+        
+        if not data_sync.is_data_available():
+            await update.message.reply_text("❌ Duomenų nėra. Naudokite /update.")
+            return
+        
+        # Get processed data from JSON storage
+        tuples = data_sync.get_processed_data_for_reminders()
+        if not tuples:
+            await update.message.reply_text("📭 Nėra duomenų pranešimams.")
+            return
+        
+        # Process deadlines
+        latest = latest_by_plate_event(tuples)
+        today = dt.date.today()
+        upcoming, expired = compute_windows(today, latest)
+        text = format_summary_lt(upcoming, expired)
+        
+        if not text.strip() or "Šiandien priminimų nėra" in text:
+            await update.message.reply_text("📭 Šiandien priminimų nėra.")
+            return
+        
+        # Send to all approved users
+        if not (cfg.spreadsheet_id and cfg.google_credentials_path):
+            await update.message.reply_text("Trūksta Sheets konfigūracijos.")
+            return
+        
+        client = SheetsClient(cfg.spreadsheet_id, cfg.google_credentials_path)
+        repo = UsersRepo(client, cfg.users_tab_name)
+        approved = repo.list_approved()
+        
+        sent = 0
+        for user in approved:
+            if user.telegram_chat_id:
+                try:
+                    await context.bot.send_message(chat_id=user.telegram_chat_id, text=text)
+                    sent += 1
+                except Exception:
+                    pass
+        
+        await update.message.reply_text(f"Išsiųsta {sent} vartotojams.")
+
+    app.add_handler(CommandHandler('sendtoday', sendtoday_cmd))
 
     # Schedule daily reminders
     print("📅 Scheduling daily reminders for 08:00 Europe/Vilnius...", flush=True)
