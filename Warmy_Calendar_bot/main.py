@@ -169,7 +169,14 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 def main():
+    import sys
+    print("🔧 Bot main() function started", flush=True)
+    sys.stdout.flush()
+    
     app = Application.builder().token(cfg.telegram_bot_token).build()
+    print("✅ Application built successfully", flush=True)
+    sys.stdout.flush()
+    
     app.add_handler(CommandHandler('start', start))
     app.add_handler(CommandHandler('pagalba', help_cmd))
     
@@ -715,7 +722,9 @@ def main():
     # Must be after ALL specific command handlers
     app.add_handler(MessageHandler(filters.COMMAND, plate_shortcut))
 
-    print("🤖 Starting bot...")
+    print("🤖 Starting bot...", flush=True)
+    import sys
+    sys.stdout.flush()
     
     # Add error handler for conflicts (less verbose)
     async def error_handler(update, context):
@@ -736,10 +745,13 @@ def main():
         await send_daily_reminders()
     
     # Schedule daily job at 8:00 AM Lithuania time
+    print("⚙️ Setting up daily scheduler...", flush=True)
+    sys.stdout.flush()
+    
     try:
         import pytz
         lithuania_tz = pytz.timezone('Europe/Vilnius')
-        print("✅ Using pytz for Lithuania timezone")
+        print("✅ Using pytz for Lithuania timezone", flush=True)
     except ImportError:
         # Fallback - Lithuania is UTC+2 in winter, UTC+3 in summer
         from datetime import datetime
@@ -747,24 +759,29 @@ def main():
         # Simple DST check: DST is roughly March-October
         if 3 <= now.month <= 10:
             lithuania_tz = timezone(timedelta(hours=3))  # Summer time
-            print("🌞 Using UTC+3 (summer time)")
+            print("🌞 Using UTC+3 (summer time)", flush=True)
         else:
             lithuania_tz = timezone(timedelta(hours=2))  # Winter time  
-            print("❄️ Using UTC+2 (winter time)")
+            print("❄️ Using UTC+2 (winter time)", flush=True)
+    
+    sys.stdout.flush()
     
     # Add the daily job
     job_time = dt.time(hour=8, minute=0, tzinfo=lithuania_tz)
     app.job_queue.run_daily(daily_job, time=job_time, name="daily_reminders")
-    print(f"📅 Daily reminder job scheduled for 08:00 {lithuania_tz}")
+    print(f"📅 Daily reminder job scheduled for 08:00 {lithuania_tz}", flush=True)
+    sys.stdout.flush()
     
     # Start the bot normally
-    print("🤖 Starting bot with daily reminders...")
-    print("⏳ Waiting 3 seconds for any previous instances to clear...")
+    print("🤖 Starting bot with daily reminders...", flush=True)
+    print("⏳ Waiting 3 seconds for any previous instances to clear...", flush=True)
+    sys.stdout.flush()
     
     import time
     time.sleep(3)  # Give time for previous instance to clear
     
-    print("🚀 Starting polling...")
+    print("🚀 Starting polling...", flush=True)
+    sys.stdout.flush()
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
