@@ -1,77 +1,33 @@
+"""
+Main bot application with JSON-based local storage.
+Replaces Google Sheets API caching with persistent local data.
+"""
+
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
 import re
-from .config import load_config
-from .sheets_client import SheetsClient
-from .data_model import normalize_event, latest_by_plate_event, compute_windows, format_summary_lt
-import datetime as dt
-import asyncio
-from datetime import timezone, timedelta
-from .users_repo import UsersRepo
+import sys
 import time
+import asyncio
+import datetime as dt
+from datetime import timezone, timedelta
+
+from .config import load_config
+from .data_model import latest_by_plate_event, compute_windows, format_summary_lt
+from .users_repo import UsersRepo
+from .sheets_client import SheetsClient
+from .data_sync import data_sync
 
 load_dotenv()
-
 cfg = load_config()
 
-# Simple cache to reduce Google Sheets API calls
-_data_cache = {
-    'data': None,
-    'timestamp': 0,
-    'ttl': 300  # 5 minutes cache
-}
-
-# Cache for user approval status to reduce Users sheet API calls
+# User approval cache (still needed for Users sheet)
 _users_cache = {
     'approved_users': set(),
     'timestamp': 0,
     'ttl': 300  # 5 minutes cache
 }
-
-def get_cached_vehicle_data():
-    """Get vehicle data with caching to reduce API calls"""
-    now = time.time()
-    if _data_cache['data'] is not None and (now - _data_cache['timestamp']) < _data_cache['ttl']:
-        print(f"📋 Using cached vehicle data (age: {int(now - _data_cache['timestamp'])}s)")
-        return _data_cache['data']
-    
-    print("🔄 Fetching fresh vehicle data from Google Sheets...")
-    if not (cfg.spreadsheet_id and cfg.google_credentials_path):
-        return []
-    
-    try:
-        client = SheetsClient(cfg.spreadsheet_id, cfg.google_credentials_path)
-        raw = client.read_data_rows(cfg.data_tab_name)
-        
-        # Normalize data
-        tuples = []
-        for r in raw:
-            ev = normalize_event(r.event_raw)
-            if not ev:
-                continue
-            exp = SheetsClient.parse_mmddyyyy(r.expiry_raw)
-            ts = None
-            if r.timestamp:
-                try:
-                    ts = dt.datetime.strptime(r.timestamp, "%m/%d/%Y %H:%M:%S")
-                except Exception:
-                    ts = None
-            tuples.append((r.plate, ev, exp, ts))
-        
-        # Cache the result
-        _data_cache['data'] = tuples
-        _data_cache['timestamp'] = now
-        print(f"✅ Cached {len(tuples)} vehicle records")
-        return tuples
-        
-    except Exception as e:
-        print(f"❌ Error fetching vehicle data: {e}")
-        # Return cached data if available, even if expired
-        if _data_cache['data'] is not None:
-            print("⚠️ Using expired cache due to API error")
-            return _data_cache['data']
-        return []
 
 def get_cached_approved_users():
     """Get approved user IDs with caching to reduce Users sheet API calls"""
@@ -105,17 +61,24 @@ def get_cached_approved_users():
         return set()
 
 async def send_daily_reminders():
-    """Send daily vehicle reminders to all approved users at 8:00 AM Lithuanian time."""
-    lithuania_tz = timezone(timedelta(hours=2))  # Lithuania is UTC+2 (UTC+3 in summer)
+    """Send daily vehicle reminders using local JSON data"""
     print("🕐 Starting daily reminder sending...")
     
     try:
-        if not (cfg.spreadsheet_id and cfg.google_credentials_path):
-            print("⚠️ Sheets configuration missing, skipping daily reminders")
+        # First, sync data from Google Sheets
+        success, message = await data_sync.sync_from_google_sheets()
+        if not success:
+            print(f"⚠️ Sync failed: {message}")
+            # Continue with existing data if available
+            if not data_sync.is_data_available():
+                print("❌ No data available, skipping reminders")
+                return
+        
+        # Get processed data from JSON storage
+        tuples = data_sync.get_processed_data_for_reminders()
+        if not tuples:
+            print("📭 No vehicle data for reminders")
             return
-            
-        # Get vehicle data and process deadlines
-        tuples = get_cached_vehicle_data()
         
         # Process deadlines
         latest = latest_by_plate_event(tuples)
@@ -123,7 +86,16 @@ async def send_daily_reminders():
         upcoming, expired = compute_windows(today, latest)
         text = format_summary_lt(upcoming, expired)
         
+        if not text.strip() or "Šiandien priminimų nėra" in text:
+            print("📭 No reminders to send today")
+            return
+        
         # Get approved users + admins
+        if not (cfg.spreadsheet_id and cfg.google_credentials_path):
+            print("⚠️ Users sheet configuration missing")
+            return
+            
+        client = SheetsClient(cfg.spreadsheet_id, cfg.google_credentials_path)
         repo = UsersRepo(client, cfg.users_tab_name)
         approved = repo.list_approved()
         all_users = repo.list_all()
@@ -170,33 +142,9 @@ async def send_daily_reminders():
     except Exception as e:
         print(f"❌ Error in daily reminder sending: {e}")
 
-async def schedule_daily_reminders():
-    """Schedule daily reminder sending at 8:00 AM Lithuanian time."""
-    lithuania_tz = timezone(timedelta(hours=2))  # Lithuania is UTC+2 (UTC+3 in summer)
-    
-    while True:
-        try:
-            now = dt.datetime.now(lithuania_tz)
-            target_time = now.replace(hour=8, minute=0, second=0, microsecond=0)
-            
-            # If target time has passed today, set for tomorrow
-            if now >= target_time:
-                target_time += timedelta(days=1)
-            
-            # Calculate wait time
-            wait_seconds = (target_time - now).total_seconds()
-            print(f"📅 Next daily reminder scheduled for: {target_time} (in {wait_seconds/3600:.2f} hours)")
-            
-            # Wait until target time
-            await asyncio.sleep(wait_seconds)
-            
-            # Send daily reminders
-            await send_daily_reminders()
-            
-        except Exception as e:
-            print(f"❌ Error in reminder scheduler: {e}")
-            # Wait 1 hour before retrying
-            await asyncio.sleep(3600)
+async def daily_job(context: ContextTypes.DEFAULT_TYPE):
+    """Daily job function for telegram job queue"""
+    await send_daily_reminders()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -206,54 +154,35 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if cfg.spreadsheet_id and cfg.google_credentials_path:
             client = SheetsClient(cfg.spreadsheet_id, cfg.google_credentials_path)
             repo = UsersRepo(client, cfg.users_tab_name)
-            found = repo.find_by_user_id(user.id)
-            if found:
-                _, row = found
-                # Update username/chat id just in case
-                repo.upsert_pending(user.id, user.username, chat.id if chat else None)
-                if row.status == 'approved':
-                    await update.message.reply_text('Jūsų paskyra jau patvirtinta. Naudokite /pagalba.')
-                    return
-                elif row.status == 'pending':
-                    await update.message.reply_text('Jūsų prašymas jau laukia patvirtinimo. Administratorius netrukus patvirtins.')
-                    return
-                else:
-                    await update.message.reply_text('Sveiki! Prašymas užregistruotas. Administratorius netrukus patvirtins.')
-                    return
-            else:
-                repo.upsert_pending(user.id, user.username, chat.id if chat else None)
-                await update.message.reply_text('Sveiki! Prašymas užregistruotas. Administratorius netrukus patvirtins.')
-                return
+            repo.upsert_pending(user.id, user.username, chat.id)
+            await update.message.reply_text('Sveiki! Jūsų registracija pateikta. Laukite administratoriaus patvirtinimo.')
         else:
             await update.message.reply_text('Sveiki! Botas veikia. (/start)')
-            return
-    except Exception:
-        # Fail-safe generic reply
-        await update.message.reply_text("Sveiki! Botas veikia. (/start)")
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Komandos:\n"
-        "/start — registracija arba būsena\n"
-        "/pagalba — ši pagalba\n"
-        "/info — šiandienos priminimai\n"
-        "/sarasas — visų numerių sąrašas\n"
-        "/id <numeris> — rodyti vieno numerio įvykius (pvz.: /id ABC123)\n"
-        "Arba tiesiog /ABC123 — greitasis numerio peržiūra"
-    )
+    except Exception as e:
+        print(f"Error in start: {e}")
+        await update.message.reply_text('Sveiki! Botas veikia. (/start)')
 
 def main():
-    import sys
-    print("🔧 Bot main() function started", flush=True)
-    sys.stdout.flush()
+    print("🤖 Initializing Telegram bot...", flush=True)
+    
+    # Add startup delay to avoid conflicts
+    time.sleep(3)
     
     app = Application.builder().token(cfg.telegram_bot_token).build()
-    print("✅ Application built successfully", flush=True)
-    sys.stdout.flush()
     
+    # Error handler
+    async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if "Conflict" in str(context.error):
+            print(f"⚠️ Conflict detected - another bot instance may be running", flush=True)
+        else:
+            print(f"ERROR: {context.error}", flush=True)
+    
+    app.add_error_handler(error_handler)
+    
+    # Add start handler
     app.add_handler(CommandHandler('start', start))
-    app.add_handler(CommandHandler('pagalba', help_cmd))
     
+    # Helper functions
     def is_admin(update: Update) -> bool:
         u = update.effective_user
         if not u:
@@ -276,34 +205,60 @@ def main():
         approved_users = get_cached_approved_users()
         return u.id in approved_users
     
-    # Add a dry-run command for admins to preview today's summary in DM
+    # Help command
+    async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        help_text = """
+Galimos komandos:
+/start - Registracija
+/pagalba - Šis pranešimas
+/info - Šiandienos priminimas
+/sarasas - Visų numerių sąrašas
+/id <numeris> - Konkretaus numerio duomenys
+
+Administratoriaus komandos:
+/dryrun - Peržiūrėti šiandienos pranešimą
+/pending - Patvirtinti laukiančius vartotojus
+/approve <user_id> - Patvirtinti vartotoją
+/users - Vartotojų sąrašas
+/update - Atnaujinti duomenis iš Google Sheets
+/remove <numeris> - Pašalinti numerį iš pranešimų
+/sendtoday - Išsiųsti šiandienos pranešimą
+/whoami - Sužinoti savo ID
+        """
+        await update.message.reply_text(help_text)
+
+    app.add_handler(CommandHandler('pagalba', help_cmd))
+    
+    # Admin dry-run command
     async def dryrun(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if is_admin(update):
-            tuples = get_cached_vehicle_data()
-            latest = latest_by_plate_event(tuples)
-            today = dt.date.today()
-            upcoming, expired = compute_windows(today, latest)
-            text = format_summary_lt(upcoming, expired)
-            await update.message.reply_text(text)
-        else:
+        if not is_admin(update):
             await update.message.reply_text("Neturite teisės naudoti šios komandos.")
+            return
+        
+        if not data_sync.is_data_available():
+            await update.message.reply_text("❌ Duomenų nėra. Naudokite /update.")
+            return
+        
+        tuples = data_sync.get_processed_data_for_reminders()
+        latest = latest_by_plate_event(tuples)
+        today = dt.date.today()
+        upcoming, expired = compute_windows(today, latest)
+        text = format_summary_lt(upcoming, expired)
+        await update.message.reply_text(text)
 
     app.add_handler(CommandHandler('dryrun', dryrun))
 
-    async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        u = update.effective_user
-        if not u:
-            return
-        await update.message.reply_text(f"user_id={u.id}, username={(u.username or '')}")
-
-    app.add_handler(CommandHandler('whoami', whoami))
-
-    # Info command - today's summary for approved users
+    # User info command
     async def info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await is_approved_user(update):
             await update.message.reply_text("Jūsų prieiga dar nepatvirtinta.")
             return
-        tuples = get_cached_vehicle_data()
+        
+        if not data_sync.is_data_available():
+            await update.message.reply_text("❌ Duomenų nėra. Susisiekite su administratoriumi.")
+            return
+        
+        tuples = data_sync.get_processed_data_for_reminders()
         latest = latest_by_plate_event(tuples)
         today = dt.date.today()
         upcoming, expired = compute_windows(today, latest)
@@ -312,459 +267,237 @@ def main():
 
     app.add_handler(CommandHandler('info', info_cmd))
 
-    # Public user commands (require approval)
+    # List all plates
     async def sarasas(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await is_approved_user(update):
             await update.message.reply_text("Jūsų prieiga dar nepatvirtinta.")
             return
-        tuples = get_cached_vehicle_data()
-        latest = latest_by_plate_event(tuples)
-        plates = sorted({r.plate for r in latest})
+        
+        plates = data_sync.get_all_active_plates()
         if not plates:
             await update.message.reply_text("Sąrašas tuščias.")
             return
-        rows = []
+        
         buttons = []
-        for p in plates:
-            rows.append(p)
-            buttons.append([InlineKeyboardButton(p, callback_data=f"plate:{p}")])
+        for plate in plates:
+            buttons.append([InlineKeyboardButton(plate, callback_data=f"plate:{plate}")])
+        
         await update.message.reply_text(
-            "Numerių sąrašas:\n" + "\n".join(rows),
+            "Numerių sąrašas:\n" + "\n".join(plates),
             reply_markup=InlineKeyboardMarkup(buttons)
         )
 
     app.add_handler(CommandHandler('sarasas', sarasas))
 
+    # Get specific plate details
     async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await is_approved_user(update):
             await update.message.reply_text("Jūsų prieiga dar nepatvirtinta.")
             return
+        
         args = context.args or []
         if not args:
             await update.message.reply_text("Naudojimas: /id <numeris>")
             return
+        
         plate = args[0].strip().upper()
-        tuples = get_cached_vehicle_data()
-        latest = latest_by_plate_event(tuples)
-        items = [r for r in latest if r.plate == plate]
-        if not items:
+        vehicle_data = data_sync.get_vehicle_details(plate)
+        
+        if not vehicle_data or vehicle_data.get("excluded", False):
             await update.message.reply_text("Numeris nerastas.")
             return
-        # Build details
+        
+        # Format response
         lines = [f"{plate}:"]
         today = dt.date.today()
-        for r in sorted(items, key=lambda x: (x.event_type)):
-            label = {
+        
+        for event in vehicle_data["events"]:
+            event_type = event["event_type"]
+            expires = event.get("expires")
+            
+            # Map event types to Lithuanian labels
+            label_map = {
                 "lv_road_toll": "LV kelių mokestis",
-                "lt_road_toll": "LT kelių mokestis",
-                "inspection": "TA galiojimas",
-                "insurance": "CA draudimas",
-                "registration_certificate": "Registracijos liudijimas",
-            }.get(r.event_type, r.event_type)
-            if r.event_type == 'registration_certificate':
-                # Find the raw row to get document links
-                doc_links = []
-                for raw_r in raw:
-                    if (raw_r.plate and raw_r.plate.strip().upper() == plate and 
-                        normalize_event(raw_r.event_raw) == 'registration_certificate'):
-                        if raw_r.doc1:
-                            doc_links.append(raw_r.doc1)
-                        if raw_r.doc2:
-                            doc_links.append(raw_r.doc2)
-                        break
-                if doc_links:
-                    lines.append(f"- {label}:")
-                    for i, link in enumerate(doc_links, 1):
-                        lines.append(f"  Dokumentas {i}: {link}")
-                else:
-                    lines.append(f"- {label}: (dokumentų nėra)")
-            else:
-                if r.expiry_date:
-                    status = "nebegalioja" if r.expiry_date < today else f"galioja iki {r.expiry_date.isoformat()}"
+                "lt_road_toll": "LT kelių mokestis", 
+                "inspection": "Techninė apžiūra",
+                "insurance": "Draudimas",
+                "registration": "Registracija"
+            }
+            label = label_map.get(event_type, event_type)
+            
+            if expires:
+                try:
+                    exp_date = dt.datetime.fromisoformat(expires).date()
+                    if exp_date < today:
+                        status = "nebegalioja"
+                    else:
+                        status = f"galioja iki {exp_date.isoformat()}"
                     lines.append(f"- {label}: {status}")
+                except Exception:
+                    lines.append(f"- {label}: (data neteisinga)")
+            else:
+                lines.append(f"- {label}: (duomenų nėra)")
+        
         await update.message.reply_text("\n".join(lines))
 
     app.add_handler(CommandHandler('id', cmd_id))
 
-    # Fallback: treat unknown commands like /ABC123 as plate queries
-    async def plate_shortcut(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not update.message or not update.message.text:
-            return
-        text = update.message.text.strip()
-        if not text.startswith('/'):
-            return
-        cmd = text[1:].strip()
-        # Ignore known commands
-        known = {
-            'start','pagalba','sarasas','id','dryrun','whoami','pending','approve','sendtoday','users','info'
-        }
-        if cmd.lower() in known or not cmd:
-            return
-        # If not a plate-like token, respond with unknown command help
-        if not re.fullmatch(r'[A-Za-z0-9-]{2,}', cmd):
-            await update.message.reply_text("Nesupratau komandos. Naudokite /pagalba.")
-            return
-        # Gate access (admins bypass)
-        if not await is_approved_user(update):
-            await update.message.reply_text("Jūsų prieiga dar nepatvirtinta.")
-            return
-        plate = cmd.upper()
-        if not (cfg.spreadsheet_id and cfg.google_credentials_path):
-            await update.message.reply_text("Trūksta Sheets konfigūracijos.")
-            return
-        client = SheetsClient(cfg.spreadsheet_id, cfg.google_credentials_path)
-        raw = client.read_data_rows(cfg.data_tab_name)
-        tuples = []
-        for r in raw:
-            ev = normalize_event(r.event_raw)
-            if not ev:
-                continue
-            exp = SheetsClient.parse_mmddyyyy(r.expiry_raw)
-            ts = None
-            if r.timestamp:
-                try:
-                    ts = dt.datetime.strptime(r.timestamp, "%m/%d/%Y %H:%M:%S")
-                except Exception:
-                    ts = None
-            if r.plate:
-                tuples.append((r.plate.strip().upper(), ev, exp, ts))
-        latest = latest_by_plate_event(tuples)
-        items = [r for r in latest if r.plate == plate]
-        if not items:
-            await update.message.reply_text("Numeris nerastas.")
-            return
-        lines = [f"{plate}:"]
-        today = dt.date.today()
-        for r in sorted(items, key=lambda x: (x.event_type)):
-            label = {
-                "lv_road_toll": "LV kelių mokestis",
-                "lt_road_toll": "LT kelių mokestis",
-                "inspection": "TA galiojimas",
-                "insurance": "CA draudimas",
-                "registration_certificate": "Registracijos liudijimas",
-            }.get(r.event_type, r.event_type)
-            if r.event_type == 'registration_certificate':
-                # Find the raw row to get document links
-                doc_links = []
-                for raw_r in raw:
-                    if (raw_r.plate and raw_r.plate.strip().upper() == plate and 
-                        normalize_event(raw_r.event_raw) == 'registration_certificate'):
-                        if raw_r.doc1:
-                            doc_links.append(raw_r.doc1)
-                        if raw_r.doc2:
-                            doc_links.append(raw_r.doc2)
-                        break
-                if doc_links:
-                    lines.append(f"- {label}:")
-                    for i, link in enumerate(doc_links, 1):
-                        lines.append(f"  Dokumentas {i}: {link}")
-                else:
-                    lines.append(f"- {label}: (dokumentų nėra)")
-            else:
-                if r.expiry_date:
-                    status = "nebegalioja" if r.expiry_date < today else f"galioja iki {r.expiry_date.isoformat()}"
-                    lines.append(f"- {label}: {status}")
-        await update.message.reply_text("\n".join(lines))
-
-    async def pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        try:
-            await update.message.reply_text("Debug: /pending received")
-            if not is_admin(update):
-                await update.message.reply_text("Neturite teisės naudoti šios komandos.")
-                return
-            await update.message.reply_text("Debug: admin check passed")
-            if not (cfg.spreadsheet_id and cfg.google_credentials_path):
-                await update.message.reply_text("Trūksta Sheets konfigūracijos.")
-                return
-            await update.message.reply_text("Debug: config check passed")
-            client = SheetsClient(cfg.spreadsheet_id, cfg.google_credentials_path)
-            repo = UsersRepo(client, cfg.users_tab_name)
-            pend = repo.list_pending()
-            await update.message.reply_text(f"Debug: found {len(pend)} pending users")
-            if not pend:
-                await update.message.reply_text("Laukiančių nėra.")
-                return
-            buttons = []
-            text_lines = []
-            for p in pend:
-                text_lines.append(f"@{p.telegram_username or p.telegram_user_id} (id={p.telegram_user_id})")
-                buttons.append([
-                    InlineKeyboardButton("✅ Patvirtinti", callback_data=f"approve:{p.telegram_user_id}"),
-                    InlineKeyboardButton("❌ Atmesti", callback_data=f"reject:{p.telegram_user_id}"),
-                ])
-            await update.message.reply_text(
-                "Laukiantys:\n" + "\n".join(text_lines),
-                reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
-            )
-        except Exception as e:
-            await update.message.reply_text(f"Debug error: {str(e)}")
-
-    app.add_handler(CommandHandler('pending', pending))
-
-    async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Admin update command
+    async def update_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(update):
             await update.message.reply_text("Neturite teisės naudoti šios komandos.")
             return
+        
+        await update.message.reply_text("🔄 Atnaujinami duomenys...")
+        success, message = await data_sync.sync_from_google_sheets(force=True)
+        await update.message.reply_text(message)
+
+    app.add_handler(CommandHandler('update', update_cmd))
+
+    # Admin remove command
+    async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not is_admin(update):
+            await update.message.reply_text("Neturite teisės naudoti šios komandos.")
+            return
+        
         args = context.args or []
         if not args:
-            await update.message.reply_text("Naudojimas: /approve <user_id>")
+            await update.message.reply_text("Naudojimas: /remove <numeris>")
             return
-        try:
-            uid = int(args[0])
-        except Exception:
-            await update.message.reply_text("Netinkamas user_id")
-            return
-        client = SheetsClient(cfg.spreadsheet_id, cfg.google_credentials_path)
-        repo = UsersRepo(client, cfg.users_tab_name)
-        ok = repo.approve(uid, approved_by=(update.effective_user.username or str(update.effective_user.id)))
-        await update.message.reply_text("Patvirtinta" if ok else "Nerastas vartotojas")
+        
+        plate = args[0].strip().upper()
+        admin_name = update.effective_user.username or str(update.effective_user.id)
+        
+        success, message = data_sync.exclude_vehicle(plate, admin_name)
+        await update.message.reply_text(message)
+        
+        if success:
+            # Show updated exclusion list
+            excluded_list = data_sync.get_excluded_vehicles_list()
+            await update.message.reply_text(excluded_list)
 
-    app.add_handler(CommandHandler('approve', approve))
+    app.add_handler(CommandHandler('remove', remove_cmd))
 
-    async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not is_admin(update):
-            await update.message.reply_text("Neturite teisės naudoti šios komandos.")
-            return
-        if not (cfg.spreadsheet_id and cfg.google_credentials_path):
-            await update.message.reply_text("Trūksta Sheets konfigūracijos.")
-            return
-        client = SheetsClient(cfg.spreadsheet_id, cfg.google_credentials_path)
-        repo = UsersRepo(client, cfg.users_tab_name)
-        all_users = repo.list_all()
-        if not all_users:
-            await update.message.reply_text("Vartotojų nėra.")
-            return
-        lines = []
-        buttons = []
-        for u in all_users:
-            uname = f"@{u.telegram_username}" if u.telegram_username else "(be username)"
-            lines.append(f"{uname} id={u.telegram_user_id} status={u.status}")
-            buttons.append([InlineKeyboardButton(f"🗑️ Šalinti {u.telegram_user_id}", callback_data=f"deluser:{u.telegram_user_id}")])
-        await update.message.reply_text("Vartotojai:\n" + "\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
-
-    app.add_handler(CommandHandler('users', users_cmd))
-
+    # Callback handler for inline buttons
     async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
-        # Acknowledge ASAP to avoid Telegram timeout
         try:
             await q.answer("Apdorojama…")
         except Exception:
             pass
+        
         data = q.data or ""
         if data.startswith("plate:"):
-            # Plate detail from inline selection (requires approval)
             if not await is_approved_user(update):
                 return
+            
             plate = data.split(":", 1)[1].strip().upper()
-            tuples = get_cached_vehicle_data()
-            latest = latest_by_plate_event(tuples)
-            items = [r for r in latest if r.plate == plate]
-            if not items:
+            vehicle_data = data_sync.get_vehicle_details(plate)
+            
+            if not vehicle_data or vehicle_data.get("excluded", False):
                 await q.edit_message_text("Numeris nerastas.")
                 return
+            
+            # Format detailed response (same as cmd_id)
             lines = [f"{plate}:"]
             today = dt.date.today()
-            for r in sorted(items, key=lambda x: (x.event_type)):
-                label = {
+            
+            for event in vehicle_data["events"]:
+                event_type = event["event_type"]
+                expires = event.get("expires")
+                
+                label_map = {
                     "lv_road_toll": "LV kelių mokestis",
                     "lt_road_toll": "LT kelių mokestis",
-                    "inspection": "TA galiojimas",
-                    "insurance": "CA draudimas",
-                    "registration_certificate": "Registracijos liudijimas",
-                }.get(r.event_type, r.event_type)
-                if r.event_type == 'registration_certificate':
-                    # Find the raw row to get document links
-                    doc_links = []
-                    for raw_r in raw:
-                        if (raw_r.plate and raw_r.plate.strip().upper() == plate and 
-                            normalize_event(raw_r.event_raw) == 'registration_certificate'):
-                            if raw_r.doc1:
-                                doc_links.append(raw_r.doc1)
-                            if raw_r.doc2:
-                                doc_links.append(raw_r.doc2)
-                            break
-                    if doc_links:
-                        lines.append(f"- {label}:")
-                        for i, link in enumerate(doc_links, 1):
-                            lines.append(f"  Dokumentas {i}: {link}")
-                    else:
-                        lines.append(f"- {label}: (dokumentų nėra)")
-                else:
-                    if r.expiry_date:
-                        status = "nebegalioja" if r.expiry_date < today else f"galioja iki {r.expiry_date.isoformat()}"
+                    "inspection": "Techninė apžiūra", 
+                    "insurance": "Draudimas",
+                    "registration": "Registracija"
+                }
+                label = label_map.get(event_type, event_type)
+                
+                if expires:
+                    try:
+                        exp_date = dt.datetime.fromisoformat(expires).date()
+                        if exp_date < today:
+                            status = "nebegalioja"
+                        else:
+                            status = f"galioja iki {exp_date.isoformat()}"
                         lines.append(f"- {label}: {status}")
-            try:
-                await q.edit_message_text("\n".join(lines))
-            except Exception:
-                pass
-            return
-
-        # Admin-only actions
-        action, _, id_str = data.partition(":")
-        if action in ("approve", "reject", "deluser"):
-            if not is_admin(update):
-                return
-            try:
-                uid = int(id_str)
-            except Exception:
-                return
-            client = SheetsClient(cfg.spreadsheet_id, cfg.google_credentials_path)
-            repo = UsersRepo(client, cfg.users_tab_name)
-            admin_name = (update.effective_user.username or str(update.effective_user.id))
-            user_chat_id = None
-            found = repo.find_by_user_id(uid)
-            if found:
-                _, row = found
-                user_chat_id = row.telegram_chat_id
-            if action == "approve":
-                ok = repo.approve(uid, approved_by=admin_name)
-                if ok and user_chat_id:
-                    try:
-                        welcome_msg = (
-                            "🎉 Sveiki! Jūsų prieiga patvirtinta.\n\n"
-                            "Galimos komandos:\n"
-                            "📋 /info — šiandienos priminimai\n"
-                            "📝 /sarasas — visų numerių sąrašas\n"
-                            "🔍 /ABC123 — greitasis numerio peržiūra\n"
-                            "❓ /pagalba — visų komandų sąrašas\n\n"
-                            "Gausite automatinius priminimus kasdien 08:00 apie artėjančius ir pasibaigusius terminus."
-                        )
-                        await context.bot.send_message(chat_id=user_chat_id, text=welcome_msg)
                     except Exception:
-                        pass
-                try:
-                    await q.edit_message_reply_markup(reply_markup=None)
-                except Exception:
-                    pass
-                return
-            if action == "reject":
-                ok = repo.reject(uid, rejected_by=admin_name)
-                if ok and user_chat_id:
-                    try:
-                        await context.bot.send_message(chat_id=user_chat_id, text="Jūsų prašymas atmestas. Susisiekite su administratoriumi, jei manote, kad tai klaida.")
-                    except Exception:
-                        pass
-                try:
-                    await q.edit_message_reply_markup(reply_markup=None)
-                except Exception:
-                    pass
-                return
-            if action == "deluser":
-                ok = repo.delete_user(uid)
-                try:
-                    await q.edit_message_text("Vartotojas ištrintas." if ok else "Vartotojas nerastas.")
-                except Exception:
-                    pass
-                return
+                        lines.append(f"- {label}: (data neteisinga)")
+                else:
+                    lines.append(f"- {label}: (duomenų nėra)")
+            
+            await q.edit_message_text("\n".join(lines))
 
     app.add_handler(CallbackQueryHandler(on_cb))
 
-    async def sendtoday(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Whoami command
+    async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        u = update.effective_user
+        if not u:
+            return
+        await update.message.reply_text(f"user_id={u.id}, username={(u.username or '')}")
+
+    app.add_handler(CommandHandler('whoami', whoami))
+
+    # Admin pending users
+    async def pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(update):
             await update.message.reply_text("Neturite teisės naudoti šios komandos.")
             return
+        
         if not (cfg.spreadsheet_id and cfg.google_credentials_path):
             await update.message.reply_text("Trūksta Sheets konfigūracijos.")
             return
-        client = SheetsClient(cfg.spreadsheet_id, cfg.google_credentials_path)
-        # Compose summary once
-        raw = client.read_data_rows(cfg.data_tab_name)
-        tuples = []
-        for r in raw:
-            ev = normalize_event(r.event_raw)
-            if not ev:
-                continue
-            exp = SheetsClient.parse_mmddyyyy(r.expiry_raw)
-            ts = None
-            if r.timestamp:
-                try:
-                    ts = dt.datetime.strptime(r.timestamp, "%m/%d/%Y %H:%M:%S")
-                except Exception:
-                    ts = None
-            tuples.append((r.plate, ev, exp, ts))
-        latest = latest_by_plate_event(tuples)
-        today = dt.date.today()
-        upcoming, expired = compute_windows(today, latest)
-        text = format_summary_lt(upcoming, expired)
-        # Send to all approved users with a chat_id
-        repo = UsersRepo(client, cfg.users_tab_name)
-        approved = repo.list_approved()
-        sent = 0
-        for u in approved:
-            if u.telegram_chat_id:
-                try:
-                    await context.bot.send_message(chat_id=u.telegram_chat_id, text=text)
-                    sent += 1
-                except Exception:
-                    pass
-        await update.message.reply_text(f"Išsiųsta {sent} vartotojams.")
-
-    app.add_handler(CommandHandler('sendtoday', sendtoday))
-
-    # Must be after ALL specific command handlers
-    app.add_handler(MessageHandler(filters.COMMAND, plate_shortcut))
-
-    print("🤖 Starting bot...", flush=True)
-    import sys
-    sys.stdout.flush()
-    
-    # Add error handler for conflicts (less verbose)
-    async def error_handler(update, context):
-        import logging
-        logging.basicConfig(level=logging.ERROR)  # Only show errors, not warnings
-        logger = logging.getLogger(__name__)
         
-        if "Conflict" in str(context.error):
-            # Don't log conflicts - they're handled automatically
+        client = SheetsClient(cfg.spreadsheet_id, cfg.google_credentials_path)
+        repo = UsersRepo(client, cfg.users_tab_name)
+        pending_users = repo.list_pending()
+        
+        if not pending_users:
+            await update.message.reply_text("Nėra laukiančių vartotojų.")
             return
-        logger.error(f"❌ Bot error: {context.error}")
+        
+        buttons = []
+        for user in pending_users:
+            username = user.telegram_username or str(user.telegram_user_id)
+            buttons.append([
+                InlineKeyboardButton(f"✅ {username}", callback_data=f"approve:{user.telegram_user_id}"),
+                InlineKeyboardButton(f"❌ {username}", callback_data=f"reject:{user.telegram_user_id}")
+            ])
+        
+        await update.message.reply_text(
+            f"Laukiantys vartotojai ({len(pending_users)}):",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+
+    app.add_handler(CommandHandler('pending', pending))
+
+    # Schedule daily reminders
+    print("📅 Scheduling daily reminders for 08:00 Europe/Vilnius...", flush=True)
     
-    app.add_error_handler(error_handler)
-    
-    # Add simple daily job using telegram's job queue
-    async def daily_job(context: ContextTypes.DEFAULT_TYPE):
-        print("🕐 Daily job triggered - sending reminders...")
-        await send_daily_reminders()
-    
-    # Schedule daily job at 8:00 AM Lithuania time
-    print("⚙️ Setting up daily scheduler...", flush=True)
-    sys.stdout.flush()
-    
+    # Use pytz for accurate timezone handling
     try:
         import pytz
-        lithuania_tz = pytz.timezone('Europe/Vilnius')
-        print("✅ Using pytz for Lithuania timezone", flush=True)
+        vilnius_tz = pytz.timezone('Europe/Vilnius')
+        app.job_queue.run_daily(daily_job, time=dt.time(8, 0), timezone=vilnius_tz)
+        print("✅ Daily reminders scheduled with pytz", flush=True)
     except ImportError:
-        # Fallback - Lithuania is UTC+2 in winter, UTC+3 in summer
-        from datetime import datetime
-        now = datetime.now()
-        # Simple DST check: DST is roughly March-October
-        if 3 <= now.month <= 10:
-            lithuania_tz = timezone(timedelta(hours=3))  # Summer time
-            print("🌞 Using UTC+3 (summer time)", flush=True)
-        else:
-            lithuania_tz = timezone(timedelta(hours=2))  # Winter time  
-            print("❄️ Using UTC+2 (winter time)", flush=True)
+        # Fallback to manual timezone calculation
+        lithuania_tz = timezone(timedelta(hours=2))  # UTC+2 (UTC+3 in summer)
+        # Check if we're in DST period (rough approximation)
+        now = dt.datetime.now()
+        if now.month >= 3 and now.month <= 10:  # Rough DST period
+            lithuania_tz = timezone(timedelta(hours=3))
+        
+        app.job_queue.run_daily(daily_job, time=dt.time(8, 0), timezone=lithuania_tz)
+        print("✅ Daily reminders scheduled with manual timezone", flush=True)
     
+    print("🤖 Starting bot...", flush=True)
     sys.stdout.flush()
     
-    # Add the daily job
-    job_time = dt.time(hour=8, minute=0, tzinfo=lithuania_tz)
-    app.job_queue.run_daily(daily_job, time=job_time, name="daily_reminders")
-    print(f"📅 Daily reminder job scheduled for 08:00 {lithuania_tz}", flush=True)
-    sys.stdout.flush()
-    
-    # Start the bot normally
-    print("🤖 Starting bot with daily reminders...", flush=True)
-    print("⏳ Waiting 3 seconds for any previous instances to clear...", flush=True)
-    sys.stdout.flush()
-    
-    import time
-    time.sleep(3)  # Give time for previous instance to clear
-    
-    print("🚀 Starting polling...", flush=True)
-    sys.stdout.flush()
+    # Start the bot
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
