@@ -22,6 +22,13 @@ _data_cache = {
     'ttl': 300  # 5 minutes cache
 }
 
+# Cache for user approval status to reduce Users sheet API calls
+_users_cache = {
+    'approved_users': set(),
+    'timestamp': 0,
+    'ttl': 300  # 5 minutes cache
+}
+
 def get_cached_vehicle_data():
     """Get vehicle data with caching to reduce API calls"""
     now = time.time()
@@ -65,6 +72,37 @@ def get_cached_vehicle_data():
             print("⚠️ Using expired cache due to API error")
             return _data_cache['data']
         return []
+
+def get_cached_approved_users():
+    """Get approved user IDs with caching to reduce Users sheet API calls"""
+    now = time.time()
+    if _users_cache['approved_users'] and (now - _users_cache['timestamp']) < _users_cache['ttl']:
+        print(f"👥 Using cached user approvals (age: {int(now - _users_cache['timestamp'])}s)")
+        return _users_cache['approved_users']
+    
+    print("🔄 Fetching fresh user approvals from Google Sheets...")
+    if not (cfg.spreadsheet_id and cfg.google_credentials_path):
+        return set()
+    
+    try:
+        client = SheetsClient(cfg.spreadsheet_id, cfg.google_credentials_path)
+        repo = UsersRepo(client, cfg.users_tab_name)
+        approved = repo.list_approved()
+        approved_ids = {user.telegram_user_id for user in approved}
+        
+        # Cache the result
+        _users_cache['approved_users'] = approved_ids
+        _users_cache['timestamp'] = now
+        print(f"✅ Cached {len(approved_ids)} approved users")
+        return approved_ids
+        
+    except Exception as e:
+        print(f"❌ Error fetching user approvals: {e}")
+        # Return cached data if available, even if expired
+        if _users_cache['approved_users']:
+            print("⚠️ Using expired user cache due to API error")
+            return _users_cache['approved_users']
+        return set()
 
 async def send_daily_reminders():
     """Send daily vehicle reminders to all approved users at 8:00 AM Lithuanian time."""
@@ -235,10 +273,8 @@ def main():
         u = update.effective_user
         if not u:
             return False
-        client = SheetsClient(cfg.spreadsheet_id, cfg.google_credentials_path)
-        repo = UsersRepo(client, cfg.users_tab_name)
-        found = repo.find_by_user_id(u.id)
-        return bool(found and found[1].status == 'approved')
+        approved_users = get_cached_approved_users()
+        return u.id in approved_users
     
     # Add a dry-run command for admins to preview today's summary in DM
     async def dryrun(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -521,24 +557,7 @@ def main():
             if not await is_approved_user(update):
                 return
             plate = data.split(":", 1)[1].strip().upper()
-            if not (cfg.spreadsheet_id and cfg.google_credentials_path):
-                return
-            client = SheetsClient(cfg.spreadsheet_id, cfg.google_credentials_path)
-            raw = client.read_data_rows(cfg.data_tab_name)
-            tuples = []
-            for r in raw:
-                ev = normalize_event(r.event_raw)
-                if not ev:
-                    continue
-                exp = SheetsClient.parse_mmddyyyy(r.expiry_raw)
-                ts = None
-                if r.timestamp:
-                    try:
-                        ts = dt.datetime.strptime(r.timestamp, "%m/%d/%Y %H:%M:%S")
-                    except Exception:
-                        ts = None
-                if r.plate:
-                    tuples.append((r.plate.strip().upper(), ev, exp, ts))
+            tuples = get_cached_vehicle_data()
             latest = latest_by_plate_event(tuples)
             items = [r for r in latest if r.plate == plate]
             if not items:
