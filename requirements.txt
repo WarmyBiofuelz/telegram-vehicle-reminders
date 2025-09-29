@@ -3,3 +3,4 @@ python-dotenv==1.0.1
 APScheduler==3.10.4
 gspread==6.1.4
 google-auth==2.34.0
+pytz==2023.3

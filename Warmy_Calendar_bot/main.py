@@ -730,34 +730,36 @@ def main():
     
     app.add_error_handler(error_handler)
     
-    # Start daily reminder scheduler in background
-    async def run_bot_with_scheduler():
-        # Start the scheduler task
-        scheduler_task = asyncio.create_task(schedule_daily_reminders())
-        print("📅 Daily reminder scheduler started")
-        
-        # Start the bot
-        async with app:
-            await app.initialize()
-            await app.start()
-            print("🤖 Bot started successfully")
-            
-            # Start polling
-            await app.updater.start_polling(drop_pending_updates=True)
-            
-            # Keep running until interrupted
-            try:
-                await asyncio.Event().wait()  # Wait indefinitely
-            except KeyboardInterrupt:
-                print("🛑 Shutting down...")
-            finally:
-                scheduler_task.cancel()
-                await app.updater.stop()
-                await app.stop()
-                await app.shutdown()
+    # Add simple daily job using telegram's job queue
+    async def daily_job(context: ContextTypes.DEFAULT_TYPE):
+        print("🕐 Daily job triggered - sending reminders...")
+        await send_daily_reminders()
     
-    # Run the bot with scheduler
-    asyncio.run(run_bot_with_scheduler())
+    # Schedule daily job at 8:00 AM Lithuania time
+    try:
+        import pytz
+        lithuania_tz = pytz.timezone('Europe/Vilnius')
+        print("✅ Using pytz for Lithuania timezone")
+    except ImportError:
+        # Fallback - Lithuania is UTC+2 in winter, UTC+3 in summer
+        from datetime import datetime
+        now = datetime.now()
+        # Simple DST check: DST is roughly March-October
+        if 3 <= now.month <= 10:
+            lithuania_tz = timezone(timedelta(hours=3))  # Summer time
+            print("🌞 Using UTC+3 (summer time)")
+        else:
+            lithuania_tz = timezone(timedelta(hours=2))  # Winter time  
+            print("❄️ Using UTC+2 (winter time)")
+    
+    # Add the daily job
+    job_time = dt.time(hour=8, minute=0, tzinfo=lithuania_tz)
+    app.job_queue.run_daily(daily_job, time=job_time, name="daily_reminders")
+    print(f"📅 Daily reminder job scheduled for 08:00 {lithuania_tz}")
+    
+    # Start the bot normally
+    print("🤖 Starting bot with daily reminders...")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
     main()
