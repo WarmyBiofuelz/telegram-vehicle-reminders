@@ -481,18 +481,25 @@ Administratoriaus komandos:
     try:
         import pytz
         vilnius_tz = pytz.timezone('Europe/Vilnius')
-        app.job_queue.run_daily(daily_job, time=dt.time(8, 0), timezone=vilnius_tz)
-        print("✅ Daily reminders scheduled with pytz", flush=True)
+        # Convert 8:00 AM Vilnius time to UTC
+        vilnius_time = dt.datetime.now(vilnius_tz).replace(hour=8, minute=0, second=0, microsecond=0)
+        utc_time = vilnius_time.astimezone(pytz.UTC).time()
+        app.job_queue.run_daily(daily_job, time=utc_time)
+        print(f"✅ Daily reminders scheduled for {utc_time} UTC (08:00 Vilnius)", flush=True)
     except ImportError:
-        # Fallback to manual timezone calculation
-        lithuania_tz = timezone(timedelta(hours=2))  # UTC+2 (UTC+3 in summer)
-        # Check if we're in DST period (rough approximation)
+        # Fallback: Calculate UTC time manually
+        # Lithuania is UTC+2 (UTC+3 in summer DST)
         now = dt.datetime.now()
         if now.month >= 3 and now.month <= 10:  # Rough DST period
-            lithuania_tz = timezone(timedelta(hours=3))
+            utc_hour = 8 - 3  # 05:00 UTC = 08:00 UTC+3
+        else:
+            utc_hour = 8 - 2  # 06:00 UTC = 08:00 UTC+2
         
-        app.job_queue.run_daily(daily_job, time=dt.time(8, 0), timezone=lithuania_tz)
-        print("✅ Daily reminders scheduled with manual timezone", flush=True)
+        if utc_hour < 0:
+            utc_hour += 24
+        
+        app.job_queue.run_daily(daily_job, time=dt.time(utc_hour, 0))
+        print(f"✅ Daily reminders scheduled for {utc_hour:02d}:00 UTC (08:00 Vilnius)", flush=True)
     
     print("🤖 Starting bot...", flush=True)
     sys.stdout.flush()
