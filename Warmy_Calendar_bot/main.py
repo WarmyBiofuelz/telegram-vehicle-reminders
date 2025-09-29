@@ -717,14 +717,14 @@ def main():
 
     print("🤖 Starting bot...")
     
-    # Add error handler for conflicts
+    # Add error handler for conflicts (less verbose)
     async def error_handler(update, context):
         import logging
-        logging.basicConfig(level=logging.WARNING)
+        logging.basicConfig(level=logging.ERROR)  # Only show errors, not warnings
         logger = logging.getLogger(__name__)
         
         if "Conflict" in str(context.error):
-            logger.warning("⚠️ Conflict detected - another bot instance may be running")
+            # Don't log conflicts - they're handled automatically
             return
         logger.error(f"❌ Bot error: {context.error}")
     
@@ -759,6 +759,12 @@ def main():
     
     # Start the bot normally
     print("🤖 Starting bot with daily reminders...")
+    print("⏳ Waiting 3 seconds for any previous instances to clear...")
+    
+    import time
+    time.sleep(3)  # Give time for previous instance to clear
+    
+    print("🚀 Starting polling...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
