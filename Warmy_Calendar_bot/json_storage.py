@@ -93,11 +93,11 @@ class JSONStorage:
         tuples_for_latest = [(plate, event_type, expiry_date, timestamp) for plate, event_type, expiry_date, timestamp, doc_links in all_raw_events]
         latest_records = latest_by_plate_event(tuples_for_latest)
         
-        # Create a lookup for document links
-        doc_links_lookup = {}
+        # Create a lookup for document links and timestamps using the original data
+        data_lookup = {}
         for plate, event_type, expiry_date, timestamp, doc_links in all_raw_events:
-            key = (plate, event_type, expiry_date, timestamp)
-            doc_links_lookup[key] = doc_links
+            key = (plate, event_type, expiry_date)
+            data_lookup[key] = (doc_links, timestamp)
         
         # Build new vehicles data using only latest records
         new_vehicles = {}
@@ -112,16 +112,16 @@ class JSONStorage:
                     "last_seen": now
                 }
             
-            # Find matching document links
-            key = (record.plate, record.event_type, record.expiry_date, record.timestamp)
-            doc_links = doc_links_lookup.get(key, [])
+            # Find matching document links and timestamp
+            key = (record.plate, record.event_type, record.expiry_date)
+            doc_links, timestamp = data_lookup.get(key, ([], None))
             
             # Add event
             event = {
                 "event_type": record.event_type,
                 "expires": record.expiry_date.isoformat() if record.expiry_date else None,
                 "doc_links": doc_links,
-                "last_updated": record.timestamp.isoformat() if record.timestamp else now
+                "last_updated": timestamp.isoformat() if timestamp else now
             }
             new_vehicles[plate]["events"].append(event)
         
