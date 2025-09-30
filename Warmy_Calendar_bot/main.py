@@ -307,46 +307,57 @@ Administratoriaus komandos:
             await update.message.reply_text("Numeris nerastas.")
             return
         
-        # Format response
+        # Format response - show ALL possible parameters
         lines = [f"{plate}:"]
         today = dt.date.today()
         
+        # Define all possible parameters that should be shown
+        all_parameters = [
+            ("lv_road_toll", "LV kelių mokestis"),
+            ("lt_road_toll", "LT kelių mokestis"), 
+            ("inspection", "Techninė apžiūra"),
+            ("insurance", "Draudimas"),
+            ("registration_certificate", "Registracijos liudijimas")
+        ]
+        
+        # Create lookup for existing events
+        events_lookup = {}
         for event in vehicle_data["events"]:
-            event_type = event["event_type"]
-            expires = event.get("expires")
-            doc_links = event.get("doc_links", [])
-            
-            # Map event types to Lithuanian labels
-            label_map = {
-                "lv_road_toll": "LV kelių mokestis",
-                "lt_road_toll": "LT kelių mokestis", 
-                "inspection": "Techninė apžiūra",
-                "insurance": "Draudimas",
-                "registration": "Registracija",
-                "registration_certificate": "Registracijos liudijimas"
-            }
-            label = label_map.get(event_type, event_type)
-            
-            if event_type == "registration_certificate":
-                # Special handling for registration certificate - show document links
-                if doc_links:
-                    lines.append(f"- {label}:")
-                    for i, link in enumerate(doc_links, 1):
-                        lines.append(f"  Dokumentas {i}: {link}")
+            events_lookup[event["event_type"]] = event
+        
+        # Display all parameters in consistent order
+        for event_type, label in all_parameters:
+            if event_type in events_lookup:
+                event = events_lookup[event_type]
+                expires = event.get("expires")
+                doc_links = event.get("doc_links", [])
+                
+                if event_type == "registration_certificate":
+                    # Special handling for registration certificate - show document links
+                    if doc_links:
+                        lines.append(f"- {label}:")
+                        for i, link in enumerate(doc_links, 1):
+                            lines.append(f"  Dokumentas {i}: {link}")
+                    else:
+                        lines.append(f"- {label}: (dokumentų nėra)")
                 else:
-                    lines.append(f"- {label}: (dokumentų nėra)")
+                    # Regular event with expiry date
+                    if expires:
+                        try:
+                            exp_date = dt.datetime.fromisoformat(expires).date()
+                            if exp_date < today:
+                                status = "nebegalioja"
+                            else:
+                                status = f"galioja iki {exp_date.isoformat()}"
+                            lines.append(f"- {label}: {status}")
+                        except Exception:
+                            lines.append(f"- {label}: (data neteisinga)")
+                    else:
+                        lines.append(f"- {label}: (duomenų nėra)")
             else:
-                # Regular event with expiry date
-                if expires:
-                    try:
-                        exp_date = dt.datetime.fromisoformat(expires).date()
-                        if exp_date < today:
-                            status = "nebegalioja"
-                        else:
-                            status = f"galioja iki {exp_date.isoformat()}"
-                        lines.append(f"- {label}: {status}")
-                    except Exception:
-                        lines.append(f"- {label}: (data neteisinga)")
+                # Parameter not found in data - show as missing
+                if event_type == "registration_certificate":
+                    lines.append(f"- {label}: (dokumentų nėra)")
                 else:
                     lines.append(f"- {label}: (duomenų nėra)")
         
@@ -410,45 +421,57 @@ Administratoriaus komandos:
                 await q.edit_message_text("Numeris nerastas.")
                 return
             
-            # Format detailed response (same as cmd_id)
+            # Format detailed response - show ALL possible parameters
             lines = [f"{plate}:"]
             today = dt.date.today()
             
+            # Define all possible parameters that should be shown
+            all_parameters = [
+                ("lv_road_toll", "LV kelių mokestis"),
+                ("lt_road_toll", "LT kelių mokestis"), 
+                ("inspection", "Techninė apžiūra"),
+                ("insurance", "Draudimas"),
+                ("registration_certificate", "Registracijos liudijimas")
+            ]
+            
+            # Create lookup for existing events
+            events_lookup = {}
             for event in vehicle_data["events"]:
-                event_type = event["event_type"]
-                expires = event.get("expires")
-                doc_links = event.get("doc_links", [])
-                
-                label_map = {
-                    "lv_road_toll": "LV kelių mokestis",
-                    "lt_road_toll": "LT kelių mokestis",
-                    "inspection": "Techninė apžiūra", 
-                    "insurance": "Draudimas",
-                    "registration": "Registracija",
-                    "registration_certificate": "Registracijos liudijimas"
-                }
-                label = label_map.get(event_type, event_type)
-                
-                if event_type == "registration_certificate":
-                    # Special handling for registration certificate - show document links
-                    if doc_links:
-                        lines.append(f"- {label}:")
-                        for i, link in enumerate(doc_links, 1):
-                            lines.append(f"  Dokumentas {i}: {link}")
+                events_lookup[event["event_type"]] = event
+            
+            # Display all parameters in consistent order
+            for event_type, label in all_parameters:
+                if event_type in events_lookup:
+                    event = events_lookup[event_type]
+                    expires = event.get("expires")
+                    doc_links = event.get("doc_links", [])
+                    
+                    if event_type == "registration_certificate":
+                        # Special handling for registration certificate - show document links
+                        if doc_links:
+                            lines.append(f"- {label}:")
+                            for i, link in enumerate(doc_links, 1):
+                                lines.append(f"  Dokumentas {i}: {link}")
+                        else:
+                            lines.append(f"- {label}: (dokumentų nėra)")
                     else:
-                        lines.append(f"- {label}: (dokumentų nėra)")
+                        # Regular event with expiry date
+                        if expires:
+                            try:
+                                exp_date = dt.datetime.fromisoformat(expires).date()
+                                if exp_date < today:
+                                    status = "nebegalioja"
+                                else:
+                                    status = f"galioja iki {exp_date.isoformat()}"
+                                lines.append(f"- {label}: {status}")
+                            except Exception:
+                                lines.append(f"- {label}: (data neteisinga)")
+                        else:
+                            lines.append(f"- {label}: (duomenų nėra)")
                 else:
-                    # Regular event with expiry date
-                    if expires:
-                        try:
-                            exp_date = dt.datetime.fromisoformat(expires).date()
-                            if exp_date < today:
-                                status = "nebegalioja"
-                            else:
-                                status = f"galioja iki {exp_date.isoformat()}"
-                            lines.append(f"- {label}: {status}")
-                        except Exception:
-                            lines.append(f"- {label}: (data neteisinga)")
+                    # Parameter not found in data - show as missing
+                    if event_type == "registration_certificate":
+                        lines.append(f"- {label}: (dokumentų nėra)")
                     else:
                         lines.append(f"- {label}: (duomenų nėra)")
             
