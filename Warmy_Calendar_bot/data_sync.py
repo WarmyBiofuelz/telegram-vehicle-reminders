@@ -34,8 +34,8 @@ class DataSync:
             client = SheetsClient(cfg.spreadsheet_id, cfg.google_credentials_path)
             raw = client.read_data_rows(cfg.data_tab_name)
             
-            # Process and normalize data
-            tuples = []
+            # Process and normalize data with document links
+            raw_tuples = []
             for r in raw:
                 ev = normalize_event(r.event_raw)
                 if not ev:
@@ -47,10 +47,18 @@ class DataSync:
                         ts = dt.datetime.strptime(r.timestamp, "%m/%d/%Y %H:%M:%S")
                     except Exception:
                         ts = None
-                tuples.append((r.plate, ev, exp, ts))
+                
+                # Collect document links
+                doc_links = []
+                if r.doc1:
+                    doc_links.append(r.doc1)
+                if r.doc2:
+                    doc_links.append(r.doc2)
+                
+                raw_tuples.append((r.plate, ev, exp, ts, doc_links))
             
-            # Update JSON storage
-            success = self.storage.update_vehicle_data(tuples)
+            # Update JSON storage with enhanced data
+            success = self.storage.update_vehicle_data_enhanced(raw_tuples)
             
             if success:
                 stats = self.storage.get_stats()

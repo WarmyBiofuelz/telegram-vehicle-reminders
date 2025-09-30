@@ -68,11 +68,41 @@ class JSONStorage:
         Update vehicle data from Google Sheets sync.
         vehicles_data: List of (plate, event_type, expiry_date, timestamp) tuples
         """
-        now = dt.datetime.now().isoformat()
-        new_vehicles = {}
-        
-        # Process new data from Google Sheets
+        # Convert to enhanced format for backward compatibility
+        enhanced_data = []
         for plate, event_type, expiry_date, timestamp in vehicles_data:
+            enhanced_data.append((plate, event_type, expiry_date, timestamp, []))
+        return self.update_vehicle_data_enhanced(enhanced_data)
+    
+    def update_vehicle_data_enhanced(self, vehicles_data: List[tuple]) -> bool:
+        """
+        Update vehicle data from Google Sheets sync with document links.
+        vehicles_data: List of (plate, event_type, expiry_date, timestamp, doc_links) tuples
+        """
+        from .data_model import latest_by_plate_event
+        
+        now = dt.datetime.now().isoformat()
+        
+        # First, collect all raw data
+        all_raw_events = []
+        for plate, event_type, expiry_date, timestamp, doc_links in vehicles_data:
+            all_raw_events.append((plate, event_type, expiry_date, timestamp, doc_links))
+        
+        # Use latest_by_plate_event logic to get only the most recent entries
+        # Convert to format expected by latest_by_plate_event
+        tuples_for_latest = [(plate, event_type, expiry_date, timestamp) for plate, event_type, expiry_date, timestamp, doc_links in all_raw_events]
+        latest_records = latest_by_plate_event(tuples_for_latest)
+        
+        # Create a lookup for document links
+        doc_links_lookup = {}
+        for plate, event_type, expiry_date, timestamp, doc_links in all_raw_events:
+            key = (plate, event_type, expiry_date, timestamp)
+            doc_links_lookup[key] = doc_links
+        
+        # Build new vehicles data using only latest records
+        new_vehicles = {}
+        for record in latest_records:
+            plate = record.plate
             if plate not in new_vehicles:
                 new_vehicles[plate] = {
                     "events": [],
@@ -82,12 +112,16 @@ class JSONStorage:
                     "last_seen": now
                 }
             
+            # Find matching document links
+            key = (record.plate, record.event_type, record.expiry_date, record.timestamp)
+            doc_links = doc_links_lookup.get(key, [])
+            
             # Add event
             event = {
-                "event_type": event_type,
-                "expires": expiry_date.isoformat() if expiry_date else None,
-                "doc_links": [],  # Will be populated separately if needed
-                "last_updated": timestamp.isoformat() if timestamp else now
+                "event_type": record.event_type,
+                "expires": record.expiry_date.isoformat() if record.expiry_date else None,
+                "doc_links": doc_links,
+                "last_updated": record.timestamp.isoformat() if record.timestamp else now
             }
             new_vehicles[plate]["events"].append(event)
         

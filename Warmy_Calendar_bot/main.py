@@ -314,6 +314,7 @@ Administratoriaus komandos:
         for event in vehicle_data["events"]:
             event_type = event["event_type"]
             expires = event.get("expires")
+            doc_links = event.get("doc_links", [])
             
             # Map event types to Lithuanian labels
             label_map = {
@@ -321,22 +322,33 @@ Administratoriaus komandos:
                 "lt_road_toll": "LT kelių mokestis", 
                 "inspection": "Techninė apžiūra",
                 "insurance": "Draudimas",
-                "registration": "Registracija"
+                "registration": "Registracija",
+                "registration_certificate": "Registracijos liudijimas"
             }
             label = label_map.get(event_type, event_type)
             
-            if expires:
-                try:
-                    exp_date = dt.datetime.fromisoformat(expires).date()
-                    if exp_date < today:
-                        status = "nebegalioja"
-                    else:
-                        status = f"galioja iki {exp_date.isoformat()}"
-                    lines.append(f"- {label}: {status}")
-                except Exception:
-                    lines.append(f"- {label}: (data neteisinga)")
+            if event_type == "registration_certificate":
+                # Special handling for registration certificate - show document links
+                if doc_links:
+                    lines.append(f"- {label}:")
+                    for i, link in enumerate(doc_links, 1):
+                        lines.append(f"  Dokumentas {i}: {link}")
+                else:
+                    lines.append(f"- {label}: (dokumentų nėra)")
             else:
-                lines.append(f"- {label}: (duomenų nėra)")
+                # Regular event with expiry date
+                if expires:
+                    try:
+                        exp_date = dt.datetime.fromisoformat(expires).date()
+                        if exp_date < today:
+                            status = "nebegalioja"
+                        else:
+                            status = f"galioja iki {exp_date.isoformat()}"
+                        lines.append(f"- {label}: {status}")
+                    except Exception:
+                        lines.append(f"- {label}: (data neteisinga)")
+                else:
+                    lines.append(f"- {label}: (duomenų nėra)")
         
         await update.message.reply_text("\n".join(lines))
 
@@ -405,28 +417,40 @@ Administratoriaus komandos:
             for event in vehicle_data["events"]:
                 event_type = event["event_type"]
                 expires = event.get("expires")
+                doc_links = event.get("doc_links", [])
                 
                 label_map = {
                     "lv_road_toll": "LV kelių mokestis",
                     "lt_road_toll": "LT kelių mokestis",
                     "inspection": "Techninė apžiūra", 
                     "insurance": "Draudimas",
-                    "registration": "Registracija"
+                    "registration": "Registracija",
+                    "registration_certificate": "Registracijos liudijimas"
                 }
                 label = label_map.get(event_type, event_type)
                 
-                if expires:
-                    try:
-                        exp_date = dt.datetime.fromisoformat(expires).date()
-                        if exp_date < today:
-                            status = "nebegalioja"
-                        else:
-                            status = f"galioja iki {exp_date.isoformat()}"
-                        lines.append(f"- {label}: {status}")
-                    except Exception:
-                        lines.append(f"- {label}: (data neteisinga)")
+                if event_type == "registration_certificate":
+                    # Special handling for registration certificate - show document links
+                    if doc_links:
+                        lines.append(f"- {label}:")
+                        for i, link in enumerate(doc_links, 1):
+                            lines.append(f"  Dokumentas {i}: {link}")
+                    else:
+                        lines.append(f"- {label}: (dokumentų nėra)")
                 else:
-                    lines.append(f"- {label}: (duomenų nėra)")
+                    # Regular event with expiry date
+                    if expires:
+                        try:
+                            exp_date = dt.datetime.fromisoformat(expires).date()
+                            if exp_date < today:
+                                status = "nebegalioja"
+                            else:
+                                status = f"galioja iki {exp_date.isoformat()}"
+                            lines.append(f"- {label}: {status}")
+                        except Exception:
+                            lines.append(f"- {label}: (data neteisinga)")
+                    else:
+                        lines.append(f"- {label}: (duomenų nėra)")
             
             await q.edit_message_text("\n".join(lines))
         
